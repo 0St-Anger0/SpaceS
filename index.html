@@ -72,6 +72,8 @@
     <script>
         let scene, camera, renderer, shipGroup, shipSprite;
         let isLoading = true;
+        let shipSelected = false; // Prevents the logic lock
+        let shipThruster; // Reference for the fire FX
         let score = 0;
         let health = 3;
         let gameOver = false;
@@ -87,34 +89,114 @@
         const mouse = new THREE.Vector2();
         let isMouseDown = false;
 
+        // --- NEW: Thruster Class for Fire FX ---
+        class Thruster {
+            constructor(parentGroup) {
+                this.particles = [];
+                this.group = new THREE.Group();
+                this.group.position.set(0, -3.5, 0); // Position at the back of the ship
+                parentGroup.add(this.group);
+            }
+
+            update() {
+                // Spawn new fire particles
+                if (Math.random() > 0.3) {
+                    const mat = new THREE.MeshBasicMaterial({
+                        color: 0xffaa00,
+                        transparent: true,
+                        opacity: 0.8,
+                        blending: THREE.AdditiveBlending // Gives it that fiery glow
+                    });
+                    const geo = new THREE.BoxGeometry(0.6, 0.6, 0.6);
+                    const p = new THREE.Mesh(geo, mat);
+                    
+                    p.position.set((Math.random() - 0.5) * 0.8, 0, 0);
+                    p.userData = {
+                        life: 1.0,
+                        velocity: new THREE.Vector3((Math.random() - 0.5) * 0.1, -Math.random() * 0.3 - 0.2, 0)
+                    };
+                    
+                    this.group.add(p);
+                    this.particles.push(p);
+                }
+
+                // Update existing particles
+                for (let i = this.particles.length - 1; i >= 0; i--) {
+                    const p = this.particles[i];
+                    p.position.add(p.userData.velocity);
+                    p.userData.life -= 0.05;
+                    p.scale.multiplyScalar(0.85); // Shrink as they fall
+                    p.material.opacity = p.userData.life;
+                    
+                    // Transition color from yellow/orange to red as it cools down
+                    if (p.userData.life < 0.6) {
+                        p.material.color.setHex(0xff2200);
+                    }
+
+                    if (p.userData.life <= 0) {
+                        this.group.remove(p);
+                        this.particles.splice(i, 1);
+                    }
+                }
+            }
+        }
+
+        // --- UPDATED: Explosion Class with Glow ---
         class Explosion {
             constructor(pos, color) {
                 const particleCount = 15;
                 this.meshGroup = new THREE.Group();
                 scene.add(this.meshGroup);
                 
+                // Additive Blending for glowing debris
                 const geometry = new THREE.SphereGeometry(0.2, 4, 4);
-                const material = new THREE.MeshBasicMaterial({ color: color });
+                const material = new THREE.MeshBasicMaterial({ 
+                    color: color, 
+                    transparent: true, 
+                    blending: THREE.AdditiveBlending 
+                });
 
                 for (let i = 0; i < particleCount; i++) {
                     const p = new THREE.Mesh(geometry, material);
                     p.userData.velocity = new THREE.Vector3(
-                        (Math.random() - 0.5) * 0.6,
-                        (Math.random() - 0.5) * 0.6,
-                        (Math.random() - 0.5) * 0.6
+                        (Math.random() - 0.5) * 0.8,
+                        (Math.random() - 0.5) * 0.8,
+                        (Math.random() - 0.5) * 0.8
                     );
                     this.meshGroup.add(p);
                 }
+                
+                // Add a bright central flash
+                const flashMat = new THREE.MeshBasicMaterial({
+                    color: 0xffffff,
+                    transparent: true,
+                    opacity: 1.0,
+                    blending: THREE.AdditiveBlending
+                });
+                this.flash = new THREE.Mesh(new THREE.SphereGeometry(1.5, 8, 8), flashMat);
+                this.meshGroup.add(this.flash);
+
                 this.meshGroup.position.copy(pos);
                 this.lifespan = 1.0;
             }
 
             update() {
                 this.lifespan -= 0.03;
+                
+                // Update debris
                 this.meshGroup.children.forEach(p => {
-                    p.position.add(p.userData.velocity);
+                    if (p !== this.flash) p.position.add(p.userData.velocity);
                 });
                 this.meshGroup.scale.multiplyScalar(0.95);
+
+                // Fade out the central flash very quickly
+                if (this.flash) {
+                    this.flash.material.opacity -= 0.15;
+                    if (this.flash.material.opacity <= 0) {
+                        this.meshGroup.remove(this.flash);
+                        this.flash = null;
+                    }
+                }
             }
         }
 
@@ -181,7 +263,6 @@
             animate();
         }
 
-        // Global scope function for the HTML buttons
         window.selectShip = function(index) {
             const spriteMaterial = new THREE.SpriteMaterial({ map: textures.ships[index], transparent: true });
             shipSprite = new THREE.Sprite(spriteMaterial);
@@ -200,6 +281,10 @@
             target.userData = { isStart: true };
             scene.add(target);
             loadingTargets.push(target);
+
+            // Unlock Controls & Init Thrusters
+            shipSelected = true;
+            shipThruster = new Thruster(shipGroup);
         };
 
         function spawnEnemy() {
@@ -255,26 +340,45 @@
 
         let lastFire = 0;
         function fireLaser() {
-            const laser = new THREE.Mesh(
-                new THREE.CylinderGeometry(0.1, 0.1, 1.5),
-                new THREE.MeshBasicMaterial({ color: 0x00ffff })
-            );
-            laser.position.copy(shipGroup.position);
-            laser.position.y += 2;
-            laser.rotation.x = Math.PI / 2;
-            scene.add(laser);
-            lasers.push(laser);
+            const laserGroup = new THREE.Group();
+            laserGroup.position.copy(shipGroup.position);
+            laserGroup.position.y += 2;
+
+            // Core of the laser (Solid White)
+            const coreGeo = new THREE.CylinderGeometry(0.1, 0.1, 1.5);
+            const coreMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+            const core = new THREE.Mesh(coreGeo, coreMat);
+            core.rotation.x = Math.PI / 2;
+            laserGroup.add(core);
+
+            // Glowing Halo of the laser (Cyan Additive Blending)
+            const glowGeo = new THREE.CylinderGeometry(0.4, 0.4, 1.8);
+            const glowMat = new THREE.MeshBasicMaterial({ 
+                color: 0x00ffff, 
+                transparent: true, 
+                opacity: 0.5,
+                blending: THREE.AdditiveBlending 
+            });
+            const glow = new THREE.Mesh(glowGeo, glowMat);
+            glow.rotation.x = Math.PI / 2;
+            laserGroup.add(glow);
+
+            scene.add(laserGroup);
+            lasers.push(laserGroup);
             lastFire = Date.now();
         }
 
         function animate() {
             requestAnimationFrame(animate);
 
-            if (!gameOver && !isLoading) {
+            // Movement and Controls are active as long as a ship is selected and you aren't dead
+            if (!gameOver && shipSelected) {
                 const targetX = mouse.x * 22;
                 const targetY = mouse.y * 15 + 2; 
                 shipGroup.position.x += (targetX - shipGroup.position.x) * 0.15;
                 shipGroup.position.y += (targetY - shipGroup.position.y) * 0.15;
+
+                if (shipThruster) shipThruster.update();
 
                 if (isMouseDown && Date.now() - lastFire > 150) fireLaser();
             }
@@ -335,11 +439,10 @@
 
                         if (e.userData.health <= 0) {
                             if (e.userData.isTank) {
-                                // Briefly show dead texture before exploding
                                 e.material.map = textures.enemy2_dead;
-                                if (Math.random() > 0.4) dropBattery(e.position); // 60% drop rate for tanks
+                                if (Math.random() > 0.4) dropBattery(e.position);
                             } else {
-                                if (Math.random() > 0.9) dropBattery(e.position); // 10% drop rate for scouts
+                                if (Math.random() > 0.9) dropBattery(e.position);
                             }
                             
                             particles.push(new Explosion(e.position, e.userData.isTank ? 0xffff00 : 0xff3300));
